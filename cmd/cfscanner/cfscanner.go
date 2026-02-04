@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"net"
 	"os"
 	"sort"
 	"strings"
@@ -25,24 +26,37 @@ var CFscannerCmd = &cobra.Command{
 	Short: "Cloudflare's edge IP scanner with latency/speed tests and real-time resume.",
 	Long: `Scans Cloudflare IP ranges to find optimal edge nodes. It supports latency testing,
 speed testing, and can resume scans from previous results. The results are saved
-in a CSV file for easy analysis and reuse. You can provide subnets directly, or
-pass a file containing one subnet per line.`,
+in a CSV file for easy analysis and reuse. You can provide subnets, single IPs,
+or pass a file containing IPs/CIDRs (one per line).`,
 	Run: func(cmd *cobra.Command, args []string) {
+
 		var allSubnets []string
+
 		for _, arg := range cliConfig.Subnets {
+			// اگر فایل بود
 			if fileInfo, err := os.Stat(arg); err == nil && !fileInfo.IsDir() {
-				allSubnets = append(allSubnets, utils.ParseFileByNewline(arg)...)
+				lines := utils.ParseFileByNewline(arg)
+				for _, line := range lines {
+					if normalized, err := normalizeIPOrCIDR(strings.TrimSpace(line)); err == nil {
+						allSubnets = append(allSubnets, normalized)
+					} else {
+						customlog.Printf(customlog.Warning, "Invalid IP/CIDR skipped: %s\n", line)
+					}
+				}
 			} else {
-				if trimmed := strings.TrimSpace(arg); trimmed != "" {
-					allSubnets = append(allSubnets, trimmed)
+				if normalized, err := normalizeIPOrCIDR(strings.TrimSpace(arg)); err == nil {
+					allSubnets = append(allSubnets, normalized)
+				} else {
+					customlog.Printf(customlog.Warning, "Invalid IP/CIDR skipped: %s\n", arg)
 				}
 			}
 		}
 
 		if len(allSubnets) == 0 {
-			customlog.Printf(customlog.Failure, "No subnets found. Please provide a valid file or CIDR list for the --subnets flag.\n")
+			customlog.Printf(customlog.Failure, "No valid IPs or subnets found. Please provide valid input.\n")
 			return
 		}
+
 		cliConfig.Subnets = allSubnets
 
 		if !cliConfig.Resume {
@@ -59,7 +73,7 @@ pass a file containing one subnet per line.`,
 		}
 
 		progressChan := make(chan *pkgscanner.ScanResult, cliConfig.ThreadCount)
-		// Use a map to store results, with the IP as the key. This prevents duplicates.
+
 		finalResultsMap := make(map[string]*pkgscanner.ScanResult)
 		var mapMu sync.Mutex
 		var wg sync.WaitGroup
@@ -72,15 +86,24 @@ pass a file containing one subnet per line.`,
 				finalResultsMap[res.IP] = res
 				mapMu.Unlock()
 
-				// Logging remains the same, showing real-time progress.
 				if res.Error != nil {
 					if cliConfig.Verbose {
 						customlog.Printf(customlog.Warning, "IP %s failed test: %v\n", res.IP, res.Error)
 					}
 				} else if res.DownSpeed > 0 || res.UpSpeed > 0 {
-					customlog.Printf(customlog.Success, "SPEEDTEST: %-20s | %-10v | %-15.2f | %-15.2f\n", res.IP, res.Latency.Round(time.Millisecond), res.DownSpeed, res.UpSpeed)
+					customlog.Printf(customlog.Success,
+						"SPEEDTEST: %-20s | %-10v | %-15.2f | %-15.2f\n",
+						res.IP,
+						res.Latency.Round(time.Millisecond),
+						res.DownSpeed,
+						res.UpSpeed,
+					)
 				} else {
-					customlog.Printf(customlog.Success, "LATENCY:   %-20s | %-10v\n", res.IP, res.Latency.Round(time.Millisecond))
+					customlog.Printf(customlog.Success,
+						"LATENCY:   %-20s | %-10v\n",
+						res.IP,
+						res.Latency.Round(time.Millisecond),
+					)
 				}
 			}
 		}()
@@ -88,9 +111,9 @@ pass a file containing one subnet per line.`,
 		if err := service.Run(context.Background(), progressChan); err != nil {
 			customlog.Printf(customlog.Failure, "Scan encountered an error: %v\n", err)
 		}
+
 		wg.Wait()
 
-		// Convert the map back to a slice for printing and saving.
 		mapMu.Lock()
 		var finalResults []*pkgscanner.ScanResult
 		for _, result := range finalResultsMap {
@@ -104,7 +127,7 @@ pass a file containing one subnet per line.`,
 }
 
 func init() {
-	CFscannerCmd.Flags().StringSliceVarP(&cliConfig.Subnets, "subnets", "s", nil, "Subnet(s) or file containing subnets (e.g., \"1.1.1.1/24,2.2.2.2/16\")")
+	CFscannerCmd.Flags().StringSliceVarP(&cliConfig.Subnets, "subnets", "s", nil, "IP(s), subnet(s), or file containing IP/CIDR (one per line)")
 	CFscannerCmd.Flags().IntVarP(&cliConfig.ThreadCount, "threads", "t", 100, "Count of threads for latency scan")
 	CFscannerCmd.Flags().BoolVarP(&cliConfig.DoSpeedtest, "speedtest", "p", false, "Measure download/upload speed on the fastest IPs")
 	CFscannerCmd.Flags().IntVarP(&cliConfig.SpeedtestTop, "speedtest-top", "c", 10, "Number of fastest IPs to select for speed testing")
@@ -128,8 +151,32 @@ func init() {
 	_ = CFscannerCmd.MarkFlagRequired("subnets")
 }
 
+// ---------- helpers ----------
+
+func normalizeIPOrCIDR(input string) (string, error) {
+	if input == "" {
+		return "", fmt.Errorf("empty input")
+	}
+
+	// CIDR
+	if _, _, err := net.ParseCIDR(input); err == nil {
+		return input, nil
+	}
+
+	// Single IP
+	if ip := net.ParseIP(input); ip != nil {
+		if ip.To4() != nil {
+			return ip.String() + "/32", nil
+		}
+		return ip.String() + "/128", nil
+	}
+
+	return "", fmt.Errorf("invalid IP or CIDR")
+}
+
 func printResultsToConsole(results []*pkgscanner.ScanResult, doSpeedtest, onlySpeedtestResults bool) {
 	var successfulResults, finalResults []*pkgscanner.ScanResult
+
 	for _, r := range results {
 		if r.Error == nil {
 			successfulResults = append(successfulResults, r)
@@ -168,15 +215,19 @@ func printResultsToConsole(results []*pkgscanner.ScanResult, doSpeedtest, onlySp
 
 	var header string
 	var outputLines []string
+
 	if doSpeedtest {
 		header = fmt.Sprintf("%-20s | %-10s | %-15s | %-15s", "IP", "Latency", "Downlink (Mbps)", "Uplink (Mbps)")
 	} else {
 		header = fmt.Sprintf("%-20s | %-10s", "IP", "Latency")
 	}
+
 	outputLines = append(outputLines, header)
+
 	for _, result := range finalResults {
 		outputLines = append(outputLines, formatResultLine(*result, doSpeedtest))
 	}
+
 	customlog.Println(customlog.GetColor(customlog.None, "\n--- Sorted Results ---\n"))
 	customlog.Println(customlog.GetColor(customlog.Success, strings.Join(outputLines, "\n")))
 	customlog.Println(customlog.GetColor(customlog.None, "\n--------------------\n"))
@@ -184,7 +235,13 @@ func printResultsToConsole(results []*pkgscanner.ScanResult, doSpeedtest, onlySp
 
 func formatResultLine(result pkgscanner.ScanResult, speedtestEnabled bool) string {
 	if speedtestEnabled {
-		return fmt.Sprintf("%-20s | %-10v | %-15.2f | %-15.2f", result.IP, result.Latency.Round(time.Millisecond), result.DownSpeed, result.UpSpeed)
+		return fmt.Sprintf(
+			"%-20s | %-10v | %-15.2f | %-15.2f",
+			result.IP,
+			result.Latency.Round(time.Millisecond),
+			result.DownSpeed,
+			result.UpSpeed,
+		)
 	}
 	return fmt.Sprintf("%-20s | %-10v", result.IP, result.Latency.Round(time.Millisecond))
 }
