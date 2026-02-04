@@ -1,40 +1,46 @@
 package utils
 
 import (
-	"errors"
 	"fmt"
 	"net"
 )
 
-func incrementIP(i *net.IP) {
-	ip := *i
-	for n := len(ip) - 1; n >= 0; n-- {
-		if ip[n] == 255 {
-			ip[n] = 0
-			continue
+// incrementIP increments an IP address by 1 (IPv4 or IPv6)
+func incrementIP(ip net.IP) {
+	for i := len(ip) - 1; i >= 0; i-- {
+		ip[i]++
+		if ip[i] != 0 {
+			break
 		}
-		ip[n]++
-		break
 	}
 }
 
+// IPOrCIDRToList converts a single IP or CIDR to a list of IP strings
+func IPOrCIDRToList(input string) ([]string, error) {
+	// Case 1: CIDR
+	if ip, ipNet, err := net.ParseCIDR(input); err == nil {
+		var ips []string
+		for ip := ip.Mask(ipNet.Mask); ipNet.Contains(ip); incrementIP(ip) {
+			ips = append(ips, ip.String())
+		}
+		return ips, nil
+	}
+
+	// Case 2: Single IP
+	if ip := net.ParseIP(input); ip != nil {
+		return []string{ip.String()}, nil
+	}
+
+	return nil, fmt.Errorf("invalid IP or CIDR: %s", input)
+}
+
+// Backward compatibility
 func CIDRtoListIP(cidr string) ([]string, error) {
-	ip, ipNet, err := net.ParseCIDR(cidr)
-	if err != nil {
-		return nil, errors.New(fmt.Sprintf("Couldn't parse %s CIDR", cidr))
-	}
-
-	var IPs []string
-	for ip := ip.Mask(ipNet.Mask); ipNet.Contains(ip); incrementIP(&ip) {
-		IPs = append(IPs, ip.String())
-	}
-	return IPs, nil
+	return IPOrCIDRToList(cidr)
 }
 
+// IsIPv6 checks whether the given string is a valid IPv6 address
 func IsIPv6(ipStr string) bool {
 	ip := net.ParseIP(ipStr)
-	if ip == nil {
-		return false // not a valid IP address
-	}
-	return ip.To4() == nil // if To4() returns nil, it's not an IPv4 address, hence it's IPv6
+	return ip != nil && ip.To4() == nil
 }
